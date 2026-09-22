@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Deprecated reference example for new Claude Code integrations (2026-09-22).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STORE="$(mktemp -d "${TMPDIR:-/tmp}/decision-ledger-example.XXXXXXXX")"

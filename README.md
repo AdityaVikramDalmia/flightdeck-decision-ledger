@@ -1,5 +1,10 @@
 # Decision Ledger
 
+> **Deprecated for new Claude Code integrations — 2026-09-22.** Retained as an
+> Apache-2.0 reference project. Public launch remains deferred and the repository
+> remains private. This is a maintainer status decision, not a claim that Claude
+> Code replaces every capability. No ongoing feature work or support is promised.
+
 Keep reported decisions, questions, and answers without replacing original wording
 with an interpretation. Corrections append new records; the original text remains
 readable. Open questions are derived from explicit answer references.
@@ -51,5 +56,11 @@ bash examples/roundtrip.sh
 
 See [documentation](docs/README.md) for the schema, transaction boundaries,
 recovery, and exit codes. [Provenance](PROVENANCE.md) records the source revision
-and deliberate changes. No license has been added; distribution terms remain
-unsettled.
+and deliberate changes. Licensed under Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). Repository visibility remains private.
+
+## License and maintenance
+
+Copyright 2026 Aditya Dalmia. Licensed under [Apache-2.0](LICENSE), with
+[attribution](NOTICE) and [source provenance](PROVENANCE.md). Public launch is
+deferred; repository access remains private. See the [release preparation index](docs/release/README.md),
+[contributing guide](CONTRIBUTING.md), and [security contact](SECURITY.md).
