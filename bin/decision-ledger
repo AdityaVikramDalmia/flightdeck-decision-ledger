@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""Append reported decisions and questions without rewriting their original words."""
+import argparse
+import contextlib
+import datetime as dt
+import json
+import math
+import os
+from pathlib import Path
+import re
+import signal
+import sqlite3
+import stat
+import sys
+import tempfile
+import uuid
+
+VERSION = "0.1.0rc1"
+APPLICATION_ID = 0x444C4447
+SCHEMA_VERSION = 1
+SOURCES = ("chat", "paste", "transcript")
+IDENTIFIER = re.compile(r"[0-9a-f]{32}\Z")
+ACTOR = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}\Z")
+KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+FIELDS = ("seq", "id", "kind", "words", "interpretation", "actor", "source", "occurred_at",
+          "recorded_at", "reply_to", "corrects", "root_id", "metadata")
+SCHEMA = {
+    "events": """CREATE TABLE events (
+        seq INTEGER PRIMARY KEY,
+        id TEXT NOT NULL UNIQUE,
+        kind TEXT NOT NULL CHECK(kind IN ('decision','question','answer')),
+        words TEXT NOT NULL,
+        interpretation TEXT,
+        actor TEXT,
+        source TEXT,
+        occurred_at TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        reply_to TEXT REFERENCES events(id),
+        corrects TEXT REFERENCES events(id),
+        root_id TEXT NOT NULL REFERENCES events(id),
+        metadata TEXT NOT NULL
+    )""",
+    "events_no_update": """CREATE TRIGGER events_no_update BEFORE UPDATE ON events
+        BEGIN SELECT RAISE(ABORT, 'events are append-only'); END""",
+    "events_no_delete": """CREATE TRIGGER events_no_delete BEFORE DELETE ON events
+        BEGIN SELECT RAISE(ABORT, 'events are append-only'); END""",
+}
+
+
+class Failure(Exception):
+    def __init__(self, message, code=3):
+        super().__init__(message)
+        self.code = code
+
+
+class Interrupted(BaseException):
+    def __init__(self, number):
+        self.number = number
+
+
+def diagnostic(message):
+    try:
+        os.write(2, ("decision-ledger: " + str(message) + "\n").encode("utf-8", "backslashreplace"))
+    except OSError:
+        pass
+
+
+def output(value):
+    payload = (json.dumps(value, ensure_ascii=True, allow_nan=False, sort_keys=True) + "\n").encode("ascii")
+    try:
+        while payload:
+            count = os.write(1, payload)
+            if count <= 0:
+                raise OSError("output made no progress")
+            payload = payload[count:]
+    except OSError as exc:
+        raise Failure("stdout failed; a write may already be committed. Inspect storage before retrying", 6) from exc
+
+
+def timestamp(value):
+    if not isinstance(value, str):
+        raise ValueError("timestamp must be text")
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{6})?Z", value):
+        raise ValueError("timestamp must be YYYY-MM-DDTHH:MM:SS[.ffffff]Z")
+    parsed = dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ" if "." in value else "%Y-%m-%dT%H:%M:%SZ")
+    return parsed.isoformat(timespec="microseconds") + "Z"
+
+
+def now():
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def text_value(value, label, optional=False):
+    if optional and value is None:
+        return
+    if not isinstance(value, str) or not value.strip() or "\0" in value:
+        raise ValueError(label + " must be nonblank text without NUL")
+    value.encode("utf-8", "strict")
+
+
+def interpretation_value(value):
+    text_value(value, "interpretation", optional=True)
+    if value is not None and any(char in value for char in "\r\n\v\f\x85\u2028\u2029"):
+        raise ValueError("interpretation must be one line, separate from the original words")
+
+
+def metadata_value(value):
+    if not isinstance(value, dict):
+        raise ValueError("metadata must be an object")
+    for key, item in value.items():
+        if not isinstance(key, str) or not KEY.fullmatch(key) or key in FIELDS:
+            raise ValueError("invalid or reserved metadata key")
+        if type(item) not in (str, bool, int):
+            raise ValueError("metadata values must be strings, booleans, or integers")
+        if isinstance(item, str):
+            item.encode("utf-8", "strict")
+            if "\0" in item:
+                raise ValueError("metadata cannot contain NUL")
+
+
+def reject_constant(value):
+    raise ValueError("non-finite JSON value")
+
+
+def unique_metadata_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate metadata key")
+        result[key] = value
+    return result
+
+
+def validate(connection):
+    if connection.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID:
+        raise Failure("unrecognized database; initialize a new explicit directory")
+    if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+        raise Failure("unsupported schema version")
+    actual = dict(connection.execute("SELECT name, sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'"))
+    if actual != SCHEMA:
+        raise Failure("database schema or append-only guards differ from the expected schema")
+    if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+        raise Failure("database integrity check failed")
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise Failure("database contains invalid references")
+    rows = []
+    known = {}
+    try:
+        for expected, values in enumerate(connection.execute("SELECT " + ",".join(FIELDS) + " FROM events ORDER BY seq"), 1):
+            row = dict(zip(FIELDS, values))
+            if type(row["seq"]) is not int or row["seq"] != expected:
+                raise ValueError("non-contiguous event sequence")
+            identifier = row["id"]
+            if not isinstance(identifier, str) or not IDENTIFIER.fullmatch(identifier) or identifier in known:
+                raise ValueError("invalid event identifier")
+            text_value(row["words"], "words")
+            interpretation_value(row["interpretation"])
+            if row["actor"] is not None and (not isinstance(row["actor"], str) or not ACTOR.fullmatch(row["actor"])):
+                raise ValueError("invalid actor label")
+            for name in ("occurred_at", "recorded_at"):
+                if timestamp(row[name]) != row[name]:
+                    raise ValueError("noncanonical timestamp")
+            row["metadata"] = json.loads(row["metadata"], parse_constant=reject_constant, object_pairs_hook=unique_metadata_object)
+            metadata_value(row["metadata"])
+            kind = row["kind"]
+            if kind == "question":
+                if any(row[name] is not None for name in ("source", "interpretation", "reply_to", "corrects")):
+                    raise ValueError("invalid question fields")
+                root = identifier
+            elif kind == "answer":
+                target = known.get(row["reply_to"])
+                if target is None or target["kind"] != "question" or row["corrects"] is not None:
+                    raise ValueError("answer does not reference an earlier question")
+                root = target["id"]
+            elif kind == "decision":
+                if row["reply_to"] is not None:
+                    raise ValueError("a decision cannot answer a question")
+                root = identifier
+                if row["corrects"] is not None:
+                    target = known.get(row["corrects"])
+                    if target is None or target["kind"] != "decision":
+                        raise ValueError("correction does not reference an earlier decision")
+                    root = target["root_id"]
+            else:
+                raise ValueError("unknown event kind")
+            if kind != "question" and row["source"] not in SOURCES:
+                raise ValueError("invalid reported source")
+            if row["root_id"] != root:
+                raise ValueError("invalid history root")
+            known[identifier] = row
+            rows.append(row)
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        raise Failure("invalid ledger record: " + str(exc)) from exc
+    return rows
+
+
+def database_path(directory):
+    path = Path(directory).absolute()
+    if path.is_symlink():
+        raise Failure("storage directory must not be a symlink")
+    database = path / "decisions.sqlite3"
+    if database.is_symlink():
+        raise Failure("database must not be a symlink")
+    try:
+        info = database.stat()
+    except FileNotFoundError:
+        return database
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise Failure("database must be a regular file with one directory entry")
+    return database
+
+
+def connect(path, timeout):
+    # mode=rw never creates a missing database; SQLite may recover a hot rollback journal.
+    connection = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=timeout, isolation_level=None)
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("PRAGMA trusted_schema=OFF")
+    connection.execute("PRAGMA synchronous=FULL")
+    if connection.execute("PRAGMA journal_mode").fetchone()[0] != "delete":
+        connection.close()
+        raise Failure("unsupported journal mode; expected DELETE")
+    return connection
+
+
+@contextlib.contextmanager
+def transaction(path, timeout, write=False):
+    if not path.exists():
+        raise Failure("ledger is not initialized; run init for this explicit directory", 4)
+    connection = connect(path, timeout)
+    try:
+        connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        rows = validate(connection)
+        yield connection, rows
+        if write:
+            connection.commit()
+        else:
+            connection.rollback()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def initialize(path, timeout):
+    if path.exists():
+        with transaction(path, timeout) as (_, rows):
+            return {"initialized": False, "path": str(path), "records": len(rows)}
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, spelling = tempfile.mkstemp(prefix=".decision-ledger-init-", dir=str(path.parent))
+    os.close(descriptor)
+    temporary = Path(spelling)
+    connection = None
+    try:
+        connection = sqlite3.connect(str(temporary), timeout=timeout, isolation_level=None)
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("BEGIN IMMEDIATE")
+        for sql in SCHEMA.values():
+            connection.execute(sql)
+        connection.execute("PRAGMA application_id=" + str(APPLICATION_ID))
+        connection.execute("PRAGMA user_version=" + str(SCHEMA_VERSION))
+        connection.commit()
+        validate(connection)
+        connection.close()
+        connection = None
+        # A hard-link publication is exclusive: another initializer cannot be overwritten.
+        os.link(str(temporary), str(path))
+        temporary.unlink()
+        directory = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except FileExistsError:
+        with transaction(path, timeout) as (_, rows):
+            return {"initialized": False, "path": str(path), "records": len(rows)}
+    finally:
+        if connection is not None:
+            connection.close()
+        for leftover in (temporary, Path(str(temporary) + "-journal")):
+            with contextlib.suppress(FileNotFoundError):
+                leftover.unlink()
+    return {"initialized": True, "path": str(path), "records": 0}
+
+
+def read_words(args):
+    selected = sum((args.words is not None, args.words_stdin, args.words_file is not None))
+    if selected != 1:
+        raise ValueError("choose exactly one positional WORDS, --words-stdin, or --words-file")
+    if args.words_stdin:
+        pieces = []
+        while True:
+            piece = os.read(0, 65536)
+            if not piece:
+                break
+            pieces.append(piece)
+        value = b"".join(pieces).decode("utf-8", "strict")
+    elif args.words_file is not None:
+        descriptor = os.open(args.words_file, os.O_RDONLY | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError("--words-file must name a regular file")
+            value = stream.read().decode("utf-8", "strict")
+    else:
+        value = args.words
+    text_value(value, "words")
+    return value
+
+
+def prepare(args):
+    words = read_words(args)
+    interpretation = getattr(args, "interpretation", None)
+    interpretation_value(interpretation)
+    if args.actor is not None and not ACTOR.fullmatch(args.actor):
+        raise ValueError("actor must be a 1-128 character identifier label")
+    metadata = {}
+    for item in args.meta:
+        key, sep, value = item.partition("=")
+        if not sep or key in metadata:
+            raise ValueError("metadata needs unique key=value pairs")
+        if value in ("true", "false"):
+            value = value == "true"
+        elif re.fullmatch(r"0|[1-9][0-9]*", value):
+            value = int(value)
+        metadata[key] = value
+    metadata_value(metadata)
+    occurred = timestamp(args.at) if args.at is not None else None
+    return words, interpretation, metadata, occurred
+
+
+def append(path, timeout, args, prepared):
+    words, interpretation, metadata, occurred = prepared
+    kind = {"record": "decision", "ask": "question", "answer": "answer"}[args.action]
+    identifier = uuid.uuid4().hex
+    reply_to = args.question if kind == "answer" else None
+    corrects = getattr(args, "corrects", None)
+    with transaction(path, timeout, write=True) as (connection, rows):
+        known = {row["id"]: row for row in rows}
+        root = identifier
+        target = reply_to if reply_to is not None else corrects
+        if target is not None:
+            if target not in known:
+                raise Failure("unknown reference identifier", 4)
+            expected = "question" if reply_to is not None else "decision"
+            if known[target]["kind"] != expected:
+                raise Failure("reference must name a " + expected, 4)
+            root = known[target]["root_id"]
+        recorded = now()
+        row = dict(seq=len(rows) + 1, id=identifier, kind=kind, words=words,
+                   interpretation=interpretation, actor=args.actor,
+                   source=getattr(args, "source", None), occurred_at=occurred or recorded,
+                   recorded_at=recorded, reply_to=reply_to, corrects=corrects, root_id=root,
+                   metadata=metadata)
+        values = [json.dumps(metadata, ensure_ascii=True, allow_nan=False) if field == "metadata" else row[field]
+                  for field in FIELDS]
+        connection.execute("INSERT INTO events (" + ",".join(FIELDS) + ") VALUES (" + ",".join("?" for _ in FIELDS) + ")", values)
+    return row
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version="decision-ledger " + VERSION)
+    parser.add_argument("--dir", default=os.environ.get("DECISION_LEDGER_DIR"), help="explicit storage directory")
+    parser.add_argument("--timeout", type=float, default=10, help="SQLite contention wait in seconds (default 10)")
+    commands = parser.add_subparsers(dest="action", required=True)
+    for name in ("init", "open", "validate"):
+        commands.add_parser(name)
+    listing = commands.add_parser("list")
+    listing.add_argument("--kind", choices=("decision", "question", "answer"))
+    listing.add_argument("--actor")
+    history = commands.add_parser("history")
+    history.add_argument("identifier")
+    for name in ("record", "ask", "answer"):
+        command = commands.add_parser(name)
+        if name == "answer":
+            command.add_argument("question")
+        command.add_argument("words", nargs="?")
+        command.add_argument("--words-stdin", action="store_true")
+        command.add_argument("--words-file")
+        command.add_argument("--actor")
+        command.add_argument("--at")
+        command.add_argument("--meta", action="append", default=[])
+        if name != "ask":
+            command.add_argument("--source", choices=SOURCES, default="chat")
+            command.add_argument("--interpretation")
+        if name == "record":
+            command.add_argument("--corrects")
+    args = parser.parse_args()
+    if not args.dir:
+        parser.error("specify --dir or DECISION_LEDGER_DIR")
+    if not math.isfinite(args.timeout) or not 0 <= args.timeout <= 86400:
+        parser.error("--timeout must be between 0 and 86400 seconds")
+    path = database_path(args.dir)
+    if args.action == "init":
+        result = initialize(path, args.timeout)
+    elif args.action in ("record", "ask", "answer"):
+        try:
+            prepared = prepare(args)
+        except (ValueError, UnicodeError) as exc:
+            raise Failure(str(exc), 2) from exc
+        result = append(path, args.timeout, args, prepared)
+    else:
+        with transaction(path, args.timeout) as (_, rows):
+            if args.action == "open":
+                answered = {row["reply_to"] for row in rows if row["kind"] == "answer"}
+                result = [row for row in rows if row["kind"] == "question" and row["id"] not in answered]
+            elif args.action == "list":
+                result = [row for row in rows if (args.kind is None or row["kind"] == args.kind)
+                          and (args.actor is None or row["actor"] == args.actor)]
+            elif args.action == "validate":
+                result = {"valid": True, "records": len(rows)}
+            else:
+                event = next((row for row in rows if row["id"] == args.identifier), None)
+                if event is None:
+                    raise Failure("unknown history identifier", 4)
+                events = [row for row in rows if row["root_id"] == event["root_id"]]
+                candidates = [row for row in events if row["kind"] != "question"]
+                result = {"root": events[0], "current": candidates[-1] if candidates else None, "events": events}
+    output(result)
+    return 0
+
+
+def handle_signal(number, frame):
+    raise Interrupted(number)
+
+
+def entry():
+    for number in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(number, handle_signal)
+    try:
+        return main()
+    except KeyboardInterrupt:
+        diagnostic("interrupted; inspect storage before retrying a write")
+        return 130
+    except Interrupted as exc:
+        diagnostic("interrupted; inspect storage before retrying a write")
+        return 128 + exc.number
+    except Failure as exc:
+        diagnostic(exc)
+        return exc.code
+    except sqlite3.Error as exc:
+        busy = isinstance(exc, sqlite3.OperationalError) and ("locked" in str(exc).lower() or "busy" in str(exc).lower())
+        diagnostic("storage contention" if busy else "database operation failed: " + str(exc))
+        return 5 if busy else 3
+    except (OSError, ValueError, UnicodeError) as exc:
+        diagnostic("operation failed: " + str(exc))
+        return 3
+
+
+if __name__ == "__main__":
+    sys.exit(entry())
